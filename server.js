@@ -3,125 +3,47 @@ const cors = require("cors");
 
 const app = express();
 
-// مهم لـ Railway
 const PORT = process.env.PORT || 3000;
 
-// Middleware
-app.use(cors());
 app.use(express.json());
 
-/*
-==============================
-Temporary Database
-==============================
-*/
+app.use(cors({
+  origin: "*",
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"]
+}));
 
-const users = [];
-const drivers = [];
-const pharmacies = [];
-const orders = [];
-
-/*
-==============================
-Health Check
-==============================
-*/
-
-app.get("/", (req, res) => {
-  res.send("Tiryaq backend is running");
-});
-
+// health
 app.get("/health", (req, res) => {
-  res.json({
-    status: "OK",
-    message: "Backend working correctly"
-  });
+  res.json({ status: "OK" });
 });
 
-/*
-==============================
-USER REGISTER (FIXES YOUR ERROR)
-==============================
-*/
-
+// register user
 app.post("/api/users/register", (req, res) => {
 
-  try {
+  const { name, phone, location } = req.body;
 
-    console.log("Incoming register request:", req.body);
-
-    const { name, phone, location } = req.body;
-
-    if (!name || !phone || !location) {
-
-      return res.status(400).json({
-        success: false,
-        message: "Name, phone, and location are required"
-      });
-
-    }
-
-    const newUser = {
-
-      id: Date.now().toString(),
-      name,
-      phone,
-      location,
-      createdAt: new Date()
-
-    };
-
-    users.push(newUser);
-
-    return res.status(201).json({
-
-      success: true,
-      message: "User registered successfully",
-      user: newUser
-
-    });
-
-  } catch (error) {
-
-    console.error("Register error:", error);
-
-    return res.status(500).json({
-
+  if (!name || !phone || !location) {
+    return res.status(400).json({
       success: false,
-      message: "Server error"
-
+      message: "Missing fields"
     });
-
   }
 
-});
-
-/*
-==============================
-GET USERS
-==============================
-*/
-
-app.get("/api/users", (req, res) => {
+  const user = {
+    id: Date.now().toString(),
+    name,
+    phone,
+    location
+  };
 
   res.json({
     success: true,
-    users
+    user
   });
 
 });
 
-/*
-==============================
-START SERVER
-==============================
-*/
-
 app.listen(PORT, () => {
-
-  console.log("==================================");
-  console.log("Tiryaq Backend Started");
-  console.log("PORT:", PORT);
-  console.log("==================================");
-
+  console.log("Server running on port " + PORT);
 });
