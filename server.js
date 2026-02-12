@@ -1,145 +1,283 @@
+
 const express = require('express');
 const cors = require('cors');
+const { Sequelize, DataTypes } = require('sequelize');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
+
+// --- Configuration ---
+const PORT = process.env.PORT || 8080;
+const RAILWAY_URL = 'https://tiryaq-backend-production.up.railway.app';
+const JWT_SECRET = process.env.JWT_SECRET || 'tiryaq_secret_key_secure_123';
+
+// --- Database Connection ---
+// سيقوم الكود بإنشاء ملف قاعدة بيانات محلي (SQLite) في حال لم يتم توفير رابط Postgres
+// لربطه بـ Railway Postgres، تأكد من وجود المتغير البيئي DATABASE_URL
+const sequelize = process.env.DATABASE_URL
+  ? new Sequelize(process.env.DATABASE_URL, {
+      dialect: 'postgres',
+      logging: false,
+      dialectOptions: {
+        ssl: {
+          require: true,
+          rejectUnauthorized: false
+        }
+      }
+    })
+  : new Sequelize({
+      dialect: 'sqlite',
+      storage: './database.sqlite',
+      logging: false
+    });
+
+// --- Models Definition ---
+
+// 1. Users (يشمل المستخدم العادي، الصيدلية، السائق، والأدمن)
+const User = sequelize.define('User', {
+  id: { type: DataTypes.UUID, defaultValue: DataTypes.UUIDV4, primaryKey: true },
+  name: { type: DataTypes.STRING, allowNull: false },
+  email: { type: DataTypes.STRING, unique: true, allowNull: false },
+  password: { type: DataTypes.STRING, allowNull: false },
+  role: { 
+    type: DataTypes.ENUM('user', 'pharmacy', 'driver', 'admin'), 
+    defaultValue: 'user' 
+  },
+  // Location Data
+  lat: { type: DataTypes.FLOAT },
+  lng: { type: DataTypes.FLOAT },
+  address: { type: DataTypes.STRING },
+  
+  // Status
+  isApproved: { type: DataTypes.BOOLEAN, defaultValue: false }, // للصيدليات والسائقين
+  fcmToken: { type: DataTypes.STRING }, // للإشعارات
+});
+
+// 2. Pharmacy Details (بيانات إضافية للصيدليات)
+const PharmacyMeta = sequelize.define('PharmacyMeta', {
+  pharmacyName: { type: DataTypes.STRING },
+  openingHours: { type: DataTypes.STRING },
+  isOpen: { type: DataTypes.BOOLEAN, defaultValue: true },
+  phone: { type: DataTypes.STRING }
+});
+
+// 3. Medicines (المخزون)
+const Medicine = sequelize.define('Medicine', {
+  name: { type: DataTypes.STRING, allowNull: false },
+  description: { type: DataTypes.TEXT },
+  stock: { type: DataTypes.INTEGER, defaultValue: 0 },
+  price: { type: DataTypes.FLOAT, defaultValue: 0.0 },
+  imageUrl: { type: DataTypes.STRING }
+});
+
+// 4. Orders (الطلبات)
+const Order = sequelize.define('Order', {
+  id: { type: DataTypes.UUID, defaultValue: DataTypes.UUIDV4, primaryKey: true },
+  status: { 
+    type: DataTypes.ENUM('pending', 'accepted', 'delivering', 'delivered', 'cancelled'), 
+    defaultValue: 'pending' 
+  },
+  totalPrice: { type: DataTypes.FLOAT },
+});
+
+// 5. Complaints (الشكاوى)
+const Complaint = sequelize.define('Complaint', {
+  text: { type: DataTypes.TEXT, allowNull: false },
+  senderName: { type: DataTypes.STRING }
+});
+
+// --- Relationships ---
+User.hasOne(PharmacyMeta);
+PharmacyMeta.belongsTo(User);
+
+PharmacyMeta.hasMany(Medicine);
+Medicine.belongsTo(PharmacyMeta);
+
+// المستخدم يطلب طلب
+User.hasMany(Order, { as: 'MyOrders', foreignKey: 'customerId' });
+Order.belongsTo(User, { as: 'Customer', foreignKey: 'customerId' });
+
+// السائق يوصل طلب
+User.hasMany(Order, { as: 'Deliveries', foreignKey: 'driverId' });
+Order.belongsTo(User, { as: 'Driver', foreignKey: 'driverId' });
+
+// الطلب تابع لصيدلية
+PharmacyMeta.hasMany(Order);
+Order.belongsTo(PharmacyMeta);
+
+User.hasMany(Complaint);
+Complaint.belongsTo(User);
+
+// --- Middleware ---
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-
-// Middleware
 app.use(cors());
 app.use(express.json());
 
-// In-memory storage
-const users = [];
-const pharmacies = [];
-const drivers = [];
-const orders = [];
+const authenticate = (req, res, next) => {
+  const token = req.headers.authorization?.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'Unauthorized' });
+  
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = decoded;
+    next();
+  } catch (err) {
+    res.status(403).json({ error: 'Invalid Token' });
+  }
+};
 
-// Helper to generate IDs
-const generateId = () => Math.random().toString(36).substring(2, 9);
-
-// Helper for standard response
-const success = (res, data) => res.json({ success: true, data });
-const error = (res, message, status = 400) => res.status(status).json({ success: false, message });
+const requireRole = (roles) => (req, res, next) => {
+  if (!roles.includes(req.user.role)) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  next();
+};
 
 // --- Routes ---
 
-// 1. User Registration
-app.post('/api/users/register', (req, res) => {
-  const { name, phone, location } = req.body;
-  
-  if (!name || !phone || !location) {
-    return error(res, 'Missing required fields: name, phone, location');
+// 1. Auth & Registration
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const { name, email, password, role, lat, lng, pharmacyName, phone, vehicleType } = req.body;
+    
+    // Hash password
+    const hashedPassword = await bcrypt.hash(password, 10);
+    
+    // Auto approve normal users, others need admin approval
+    const isApproved = role === 'user'; 
+
+    const user = await User.create({
+      name, email, password: hashedPassword, role, lat, lng, isApproved
+    });
+
+    if (role === 'pharmacy') {
+      await PharmacyMeta.create({ 
+        UserId: user.id, 
+        pharmacyName: pharmacyName || `${name} Pharmacy`, 
+        phone 
+      });
+    }
+
+    // Generate Token
+    const token = jwt.sign({ id: user.id, role: user.role }, JWT_SECRET);
+    res.json({ token, user: { id: user.id, name, role, isApproved } });
+
+  } catch (error) {
+    res.status(400).json({ error: error.message });
   }
-
-  // Check if user already exists (optional, simply adding for now)
-  const newUser = {
-    id: generateId(),
-    name,
-    phone,
-    location,
-    createdAt: new Date().toISOString()
-  };
-
-  users.push(newUser);
-  console.log(`User registered: ${name}`);
-  return success(res, newUser);
 });
 
-// 2. Pharmacy Registration
-app.post('/api/pharmacies/register', (req, res) => {
-  const { name, location, workingHours } = req.body;
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    const user = await User.findOne({ where: { email } });
+    
+    if (!user || !(await bcrypt.compare(password, user.password))) {
+      return res.status(401).json({ error: 'البريد أو كلمة المرور خطأ' });
+    }
 
-  if (!name || !location || !workingHours) {
-    return error(res, 'Missing required fields: name, location, workingHours');
+    const token = jwt.sign({ id: user.id, role: user.role }, JWT_SECRET);
+    
+    // Fetch pharmacy meta if exists
+    let extraData = {};
+    if (user.role === 'pharmacy') {
+      extraData = await PharmacyMeta.findOne({ where: { UserId: user.id } });
+    }
+
+    res.json({ token, user, extraData });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
-
-  // Add default medicines to every new pharmacy so the app is usable immediately
-  const defaultMedicines = [
-    { id: 'med_1', name: 'Paracetamol 500mg', description: 'Pain reliever and fever reducer', price: 5.00 },
-    { id: 'med_2', name: 'Amoxicillin 250mg', description: 'Antibiotic for bacterial infections', price: 12.50 },
-    { id: 'med_3', name: 'Vitamin C 1000mg', description: 'Immune system support supplement', price: 8.00 },
-    { id: 'med_4', name: 'Ibuprofen 400mg', description: 'Anti-inflammatory pain relief', price: 6.50 },
-    { id: 'med_5', name: 'Cough Syrup', description: 'Relief for dry and chesty coughs', price: 9.00 }
-  ];
-
-  const newPharmacy = {
-    id: generateId(),
-    name,
-    location,
-    workingHours,
-    isOpen: true, // Default to open
-    medicines: defaultMedicines,
-    createdAt: new Date().toISOString()
-  };
-
-  pharmacies.push(newPharmacy);
-  console.log(`Pharmacy registered: ${name}`);
-  return success(res, newPharmacy);
 });
 
-// 3. Get Pharmacies
-app.get('/api/pharmacies', (req, res) => {
-  // Returns all registered pharmacies
-  return success(res, pharmacies);
+// 2. Pharmacy Routes
+app.get('/api/pharmacies', async (req, res) => {
+  // Public: Get all approved pharmacies
+  const pharmacies = await PharmacyMeta.findAll({
+    include: [{ 
+      model: User, 
+      where: { isApproved: true },
+      attributes: ['lat', 'lng', 'email']
+    }]
+  });
+  res.json(pharmacies);
 });
 
-// 4. Driver Registration
-app.post('/api/drivers/register', (req, res) => {
-  const { name, phone, vehicleType } = req.body;
+app.post('/api/pharmacies/medicine', authenticate, requireRole(['pharmacy']), async (req, res) => {
+  try {
+    const { name, stock, price } = req.body;
+    const pharmacyMeta = await PharmacyMeta.findOne({ where: { UserId: req.user.id } });
+    
+    if (!pharmacyMeta) return res.status(404).json({ error: 'Pharmacy profile not found' });
 
-  if (!name || !phone || !vehicleType) {
-    return error(res, 'Missing required fields: name, phone, vehicleType');
+    const medicine = await Medicine.create({
+      name, stock, price, PharmacyMetumId: pharmacyMeta.id
+    });
+    res.json(medicine);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
-
-  const newDriver = {
-    id: generateId(),
-    name,
-    phone,
-    vehicleType,
-    status: 'available',
-    createdAt: new Date().toISOString()
-  };
-
-  drivers.push(newDriver);
-  console.log(`Driver registered: ${name}`);
-  return success(res, newDriver);
 });
 
-// 5. Create Order
-app.post('/api/orders/create', (req, res) => {
-  const { userId, pharmacyId, medicineId, userPhone, userLocation } = req.body;
+// 3. Orders & Drivers
+app.post('/api/orders', authenticate, requireRole(['user']), async (req, res) => {
+  // Create Order logic here
+  // ...
+  res.json({ message: 'Order created', orderId: 'mock-id' });
+});
 
-  if (!userId || !pharmacyId || !medicineId) {
-    return error(res, 'Missing required fields');
+// 4. Complaints
+app.post('/api/complaints', authenticate, async (req, res) => {
+  await Complaint.create({
+    text: req.body.text,
+    senderName: req.body.senderName,
+    UserId: req.user.id
+  });
+  res.json({ success: true });
+});
+
+// 5. Admin Routes
+app.get('/api/admin/pending', authenticate, requireRole(['admin']), async (req, res) => {
+  const pendingUsers = await User.findAll({ where: { isApproved: false } });
+  res.json(pendingUsers);
+});
+
+app.post('/api/admin/approve', authenticate, requireRole(['admin']), async (req, res) => {
+  const { userId } = req.body;
+  await User.update({ isApproved: true }, { where: { id: userId } });
+  res.json({ success: true });
+});
+
+// --- Server Initialization ---
+
+const startServer = async () => {
+  try {
+    // Auto-create tables (sync)
+    await sequelize.sync({ alter: true });
+    console.log("✅ Database tables created/updated.");
+
+    // Create Admin User if not exists
+    const adminUser = await User.findOne({ where: { email: 'admin' } });
+    if (!adminUser) {
+      const adminPass = await bcrypt.hash('admin', 10);
+      await User.create({
+        name: 'Admin User',
+        email: 'admin',
+        password: adminPass,
+        role: 'admin',
+        isApproved: true
+      });
+      console.log("👑 Admin account created: admin / admin");
+    }
+
+    app.listen(PORT, () => {
+      console.log(`🚀 Server running on port ${PORT}`);
+      console.log(`🔗 Railway Backend: ${RAILWAY_URL}`);
+    });
+
+  } catch (error) {
+    console.error("❌ Failed to start server:", error);
   }
+};
 
-  const newOrder = {
-    id: generateId(),
-    userId,
-    pharmacyId,
-    medicineId,
-    userPhone,
-    userLocation,
-    status: 'pending',
-    createdAt: new Date().toISOString()
-  };
-
-  orders.push(newOrder);
-  console.log(`Order created: ${newOrder.id}`);
-  return success(res, newOrder);
-});
-
-// 6. Get Orders
-app.get('/api/orders', (req, res) => {
-  return success(res, orders);
-});
-
-// Root route
-app.get('/', (req, res) => {
-  res.send('Tiryaq Backend is Running');
-});
-
-// Start Server
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+startServer();
